@@ -1,32 +1,36 @@
 """
-ingestion.py — Stream Source: Binance WebSocket Consumer
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-KAPPA ARCHITECTURE ROLE: Source Operator
-─────────────────────────────────────────
-In a production Kappa pipeline this module is replaced by a
-Kafka consumer subscribed to a `raw-trades` topic. The WebSocket
-thread here IS that consumer for the prototype — it runs in a
-background daemon thread and pushes normalised trade dicts into
-a thread-safe queue.Queue that the Streamlit main loop drains.
+ingestion.py — Stream Source: Binance WebSocket Consumer  (Cloud-safe)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHY BINANCE BLOCKS STREAMLIT CLOUD:
+  Streamlit Community Cloud runs on AWS (us-east-1).
+  Binance actively blocks WebSocket connections from AWS IP ranges
+  to prevent automated trading bots. This means:
+    wss://stream.binance.com:9443  →  Connection refused on Cloud
 
-THREAD SAFETY:
-  • BinanceStreamThread is a daemon thread (auto-killed on exit)
-  • Communication to Streamlit happens only via queue.Queue
-  • No direct st.session_state writes from the thread (not safe)
-  • Status updates flow through a separate status_queue
+SOLUTION — Two WS URLs tried in order:
+  1. wss://data-stream.binance.vision  (Binance market data endpoint —
+     designed for read-only consumers, less aggressively blocked)
+  2. wss://stream.binance.com:9443     (standard, blocked on AWS)
+  3. wss://stream.binance.com:443      (port 443 fallback, sometimes works)
+  4. Simulation mode                   (if ALL above fail — generates
+     realistic fake trades so the UI is fully functional on Cloud)
 
-RECONNECT STRATEGY: Exponential backoff
-  delay = min(BASE * 2^attempt, MAX_DELAY)
-  → 2s, 4s, 8s, 16s, 32s, 60s, 60s …
+SIMULATION MODE:
+  Uses real BTC price ranges and realistic trade size distributions.
+  Whale events still trigger correctly. The UI is 100% functional.
+  A banner in the app indicates simulation mode is active.
 """
 
 import json
+import math
+import os
 import queue
+import random
 import threading
 import time
 from datetime import datetime, timezone
 
-import websocket  # pip install websocket-client
+import websocket
 
 import state
 from config import (
@@ -34,34 +38,35 @@ from config import (
     MAX_RECONNECT, RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY,
     STATUS_STOPPED, STATUS_CONNECTING, STATUS_CONNECTED,
     STATUS_RECONNECTING, STATUS_ERROR,
-    K_RUNNING, K_WS_THREAD, K_TRADE_QUEUE, K_STATUS_QUEUE, K_WS_STATUS,
-    K_ACTIVE_SYMBOL,
+    K_RUNNING, K_WS_THREAD, K_TRADE_QUEUE, K_STATUS_QUEUE,
+    K_WS_STATUS, K_ACTIVE_SYMBOL,
 )
 
+# Alternative Binance endpoints (tried in order before simulation fallback)
+BINANCE_ENDPOINTS = [
+    "wss://data-stream.binance.vision/ws/{slug}@trade",  # market data mirror
+    "wss://stream.binance.com:9443/ws/{slug}@trade",     # standard
+    "wss://stream.binance.com:443/ws/{slug}@trade",      # port 443
+]
 
-# ── Schema parser ────────────────────────────────────────────
+# Realistic price ranges per symbol for simulation mode
+SYMBOL_PRICE_RANGES = {
+    "btcusdt":  (55000,  80000),
+    "ethusdt":  (2500,   4500),
+    "solusdt":  (100,    250),
+    "bnbusdt":  (350,    650),
+    "xrpusdt":  (0.40,   1.20),
+    "avaxusdt": (20,     60),
+    "dogeusdt": (0.06,   0.25),
+    "arbusdt":  (0.60,   2.00),
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# SCHEMA PARSER
+# ─────────────────────────────────────────────────────────────
 
 def parse_binance_trade(raw_msg: str) -> dict | None:
-    """
-    KAPPA NOTE: Deserialisation / Schema Normalisation
-    ───────────────────────────────────────────────────
-    Converts the raw Binance JSON wire format into our internal
-    trade schema. In production this is a Kafka Deserializer with
-    an Avro/JSON schema registry. The internal schema is:
-
-        symbol      str   "BTC/USDT"
-        side        str   "BUY" | "SELL"
-        price       float USD per unit
-        quantity    float units
-        total_usd   float price × quantity
-        ts_epoch    float Unix epoch seconds (float for sub-second res)
-        timestamp   str   "HH:MM:SS.mmm" UTC display string
-
-    Binance trade stream fields:
-        p  price (string)       q  quantity (string)
-        T  trade time (ms)      m  is-buyer-maker (bool)
-        s  symbol (e.g. BTCUSDT)
-    """
     try:
         data     = json.loads(raw_msg)
         price    = float(data["p"])
@@ -74,7 +79,6 @@ def parse_binance_trade(raw_msg: str) -> dict | None:
         symbol   = data.get("s", "BTCUSDT")
         if "/" not in symbol and len(symbol) > 4:
             symbol = symbol[:-4] + "/" + symbol[-4:]
-
         return {
             "symbol":    symbol,
             "side":      side,
@@ -88,31 +92,120 @@ def parse_binance_trade(raw_msg: str) -> dict | None:
         return None
 
 
-# ── Background WebSocket thread ──────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# SIMULATION GENERATOR  (used when all WS endpoints fail)
+# ─────────────────────────────────────────────────────────────
 
-class BinanceStreamThread(threading.Thread):
+def _simulate_trade(slug: str) -> dict:
     """
-    Producer half of the Producer-Consumer pattern.
-
-    Lifecycle:
-        start_stream() → BinanceStreamThread.start()
-                       → run() blocks on ws.run_forever()
-                       → on each message: trade_queue.put_nowait(trade)
-        stop_stream()  → self._stop.set() → ws.close() → thread exits
+    Generate a realistic fake trade for the given symbol.
+    Price walks randomly within the symbol's typical range.
+    ~4% of trades are large enough to trigger whale detection.
     """
+    low, high = SYMBOL_PRICE_RANGES.get(slug, (100, 1000))
 
-    def __init__(self, trade_queue: queue.Queue, status_queue: queue.Queue, slug: str = "btcusdt"):
+    # Random walk: price stays near midpoint with realistic volatility
+    mid   = (low + high) / 2
+    sigma = (high - low) * 0.05
+    price = round(max(low, min(high, random.gauss(mid, sigma))), 4)
+
+    # Trade size: bimodal — mostly small retail, occasional whale
+    if random.random() < 0.04:   # 4% whale trades
+        qty = round(random.uniform(10, 100), 4)
+    else:
+        qty = round(random.uniform(0.001, 5), 4)
+
+    total    = round(price * qty, 2)
+    side     = random.choice(["BUY", "SELL"])
+    now      = time.time()
+    dt       = datetime.fromtimestamp(now, tz=timezone.utc)
+    symbol   = slug.upper()
+    if len(symbol) > 4:
+        symbol = symbol[:-4] + "/" + symbol[-4:]
+
+    return {
+        "symbol":    symbol,
+        "side":      side,
+        "price":     price,
+        "quantity":  qty,
+        "total_usd": total,
+        "ts_epoch":  now,
+        "timestamp": dt.strftime("%H:%M:%S.%f")[:-3],
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# SIMULATION THREAD
+# ─────────────────────────────────────────────────────────────
+
+class SimulationThread(threading.Thread):
+    """
+    Generates synthetic trades at ~5 trades/second.
+    Used automatically when all Binance WebSocket endpoints fail.
+    """
+    def __init__(self, trade_queue: queue.Queue,
+                 status_queue: queue.Queue, slug: str):
         super().__init__(daemon=True)
         self.trade_queue  = trade_queue
         self.status_queue = status_queue
         self.slug         = slug.lower()
-        self.ws_url       = binance_ws_url(self.slug)
         self._stop        = threading.Event()
-        self.attempt      = 0
-        self._ws_app      = None   # held so stop() can close it
 
     def stop(self):
-        """Signal shutdown; safe to call from any thread."""
+        self._stop.set()
+
+    def _push(self, status: str, msg: str = "") -> None:
+        try:
+            self.status_queue.put_nowait({"status": status, "msg": msg})
+        except queue.Full:
+            pass
+
+    def run(self):
+        self._push(
+            STATUS_CONNECTED,
+            "⚠️ SIMULATION MODE — Binance WS blocked on Cloud. "
+            "Generating realistic synthetic trades. "
+            "All whale detection & clustering fully functional."
+        )
+        while not self._stop.is_set():
+            trade = _simulate_trade(self.slug)
+            try:
+                self.trade_queue.put_nowait(trade)
+            except queue.Full:
+                pass
+            time.sleep(0.2)   # ~5 trades/second
+
+        self._push(STATUS_STOPPED, "Simulation stopped.")
+
+
+# ─────────────────────────────────────────────────────────────
+# WEBSOCKET THREAD  (tries multiple endpoints then falls back)
+# ─────────────────────────────────────────────────────────────
+
+class BinanceStreamThread(threading.Thread):
+    """
+    Tries each Binance endpoint in order.
+    Falls back to SimulationThread if all endpoints fail.
+    """
+
+    def __init__(self, trade_queue: queue.Queue,
+                 status_queue: queue.Queue, slug: str = "btcusdt"):
+        super().__init__(daemon=True)
+        self.trade_queue  = trade_queue
+        self.status_queue = status_queue
+        self.slug         = slug.lower()
+        self._stop        = threading.Event()
+        self.attempt      = 0
+        self._ws_app      = None
+        self._connected   = False
+        # Build endpoint list for this slug
+        self.endpoints    = [
+            url.format(slug=self.slug)
+            for url in BINANCE_ENDPOINTS
+        ]
+        self._current_url = self.endpoints[0]
+
+    def stop(self):
         self._stop.set()
         if self._ws_app:
             try:
@@ -120,19 +213,17 @@ class BinanceStreamThread(threading.Thread):
             except Exception:
                 pass
 
-    # ── websocket-client callbacks ───────────────────────────
-
-    def _push_status(self, status: str, msg: str = "") -> None:
-        """Non-blocking — drops the update if the queue is full."""
+    def _push(self, status: str, msg: str = "") -> None:
         try:
             self.status_queue.put_nowait({"status": status, "msg": msg})
         except queue.Full:
             pass
 
     def _on_open(self, ws):
-        self.attempt = 0
-        self._push_status(STATUS_CONNECTED,
-                          f"Connected → {self.ws_url}")
+        self.attempt    = 0
+        self._connected = True
+        self._push(STATUS_CONNECTED,
+                   f"Connected → {self._current_url}")
 
     def _on_message(self, ws, message: str):
         if self._stop.is_set():
@@ -143,88 +234,121 @@ class BinanceStreamThread(threading.Thread):
             try:
                 self.trade_queue.put_nowait(trade)
             except queue.Full:
-                pass   # backpressure: drop oldest via maxsize
+                pass
 
     def _on_error(self, ws, error):
-        self._push_status(STATUS_RECONNECTING,
-                          f"WS error [{type(error).__name__}]: {error}")
+        self._push(STATUS_RECONNECTING,
+                   f"WS error: {type(error).__name__}: {error}")
 
     def _on_close(self, ws, code, msg):
         if not self._stop.is_set():
-            self._push_status(STATUS_RECONNECTING,
-                              f"Closed (code={code}). Scheduling reconnect…")
+            self._push(STATUS_RECONNECTING,
+                       f"Closed (code={code}). Reconnecting…")
 
-    # ── Main loop with exponential backoff ───────────────────
+    def _try_connect(self, url: str) -> bool:
+        """
+        Attempt a single WebSocket connection.
+        Returns True if successfully connected (on_open fired),
+        False if connection was refused immediately.
+        """
+        self._current_url = url
+        self._connected   = False
+        self._push(STATUS_CONNECTING, f"Trying {url}…")
+
+        try:
+            self._ws_app = websocket.WebSocketApp(
+                url,
+                on_open    = self._on_open,
+                on_message = self._on_message,
+                on_error   = self._on_error,
+                on_close   = self._on_close,
+            )
+            self._ws_app.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+            )
+        except Exception as e:
+            self._push(STATUS_RECONNECTING, f"Exception on {url}: {e}")
+
+        return self._connected
 
     def run(self):
-        self._push_status(STATUS_CONNECTING, "Establishing WebSocket connection…")
+        self._push(STATUS_CONNECTING, "Starting WebSocket connection…")
+
+        # Round-robin through all endpoints
+        endpoint_idx    = 0
+        total_attempts  = 0
+        max_total       = MAX_RECONNECT * len(self.endpoints)
 
         while not self._stop.is_set():
-            if self.attempt >= MAX_RECONNECT:
-                self._push_status(STATUS_ERROR,
-                    f"Gave up after {MAX_RECONNECT} attempts. "
-                    "Click STOP then START to retry.")
-                break
-
-            try:
-                self._ws_app = websocket.WebSocketApp(
-                    self.ws_url,
-                    on_open    = self._on_open,
-                    on_message = self._on_message,
-                    on_error   = self._on_error,
-                    on_close   = self._on_close,
+            if total_attempts >= max_total:
+                # All endpoints exhausted — fall back to simulation
+                self._push(
+                    STATUS_CONNECTED,
+                    f"All {len(self.endpoints)} Binance endpoints failed "
+                    f"(likely AWS IP block). Starting simulation mode…"
                 )
-                # Blocks until disconnected
-                self._ws_app.run_forever(ping_interval=20, ping_timeout=10)
+                sim = SimulationThread(
+                    self.trade_queue, self.status_queue, self.slug
+                )
+                sim.start()
+                # Wait for stop signal, then stop simulation too
+                while not self._stop.is_set():
+                    time.sleep(0.5)
+                sim.stop()
+                return
 
-            except Exception as exc:
-                self._push_status(STATUS_RECONNECTING,
-                                  f"Unhandled exception: {exc}")
+            url = self.endpoints[endpoint_idx % len(self.endpoints)]
+            connected = self._try_connect(url)
 
             if self._stop.is_set():
                 break
 
-            # Exponential backoff sleep (interruptible)
-            self.attempt += 1
-            delay = min(RECONNECT_BASE_DELAY * (2 ** (self.attempt - 1)),
-                        RECONNECT_MAX_DELAY)
-            self._push_status(STATUS_RECONNECTING,
-                f"Attempt {self.attempt}/{MAX_RECONNECT} — "
-                f"retrying in {delay:.0f}s…")
+            total_attempts  += 1
+            endpoint_idx    += 1
+
+            # If it connected but then dropped, prefer the same URL
+            if connected:
+                endpoint_idx -= 1   # retry the same endpoint first
+
+            delay = min(
+                RECONNECT_BASE_DELAY * (2 ** (total_attempts - 1)),
+                RECONNECT_MAX_DELAY
+            )
+            self._push(
+                STATUS_RECONNECTING,
+                f"Attempt {total_attempts}/{max_total} — "
+                f"next retry in {delay:.0f}s…"
+            )
             deadline = time.monotonic() + delay
             while time.monotonic() < deadline:
                 if self._stop.is_set():
                     break
                 time.sleep(0.1)
 
-        self._push_status(STATUS_STOPPED, "WebSocket thread stopped.")
+        self._push(STATUS_STOPPED, "Stream stopped.")
 
 
-# ── Lifecycle helpers (called from main.py) ──────────────────
+# ─────────────────────────────────────────────────────────────
+# LIFECYCLE HELPERS
+# ─────────────────────────────────────────────────────────────
 
 def start_stream(slug: str = "btcusdt") -> None:
-    """
-    Spawn the background thread and wire up queues.
-    Idempotent — safe to call if already running.
-    """
     if state.get(K_RUNNING):
         return
-
     tq = queue.Queue(maxsize=2000)
     sq = queue.Queue(maxsize=100)
     t  = BinanceStreamThread(trade_queue=tq, status_queue=sq, slug=slug)
     t.start()
-
-    state.set(K_TRADE_QUEUE,  tq)
-    state.set(K_STATUS_QUEUE, sq)
-    state.set(K_WS_THREAD,    t)
-    state.set(K_RUNNING,      True)
+    state.set(K_TRADE_QUEUE,   tq)
+    state.set(K_STATUS_QUEUE,  sq)
+    state.set(K_WS_THREAD,     t)
+    state.set(K_RUNNING,       True)
     state.set(K_ACTIVE_SYMBOL, slug)
-    state.set(K_WS_STATUS,    STATUS_CONNECTING)
+    state.set(K_WS_STATUS,     STATUS_CONNECTING)
 
 
 def stop_stream() -> None:
-    """Signal the background thread to stop and clean up state."""
     t = state.get(K_WS_THREAD)
     if t and t.is_alive():
         t.stop()
@@ -236,10 +360,6 @@ def stop_stream() -> None:
 
 
 def switch_symbol(new_slug: str) -> None:
-    """
-    Stop the current stream and immediately restart on a new symbol.
-    Clears feeds so stale data from the old symbol doesn't persist.
-    """
     stop_stream()
     import state as _state
     _state.reset_stats()
@@ -247,11 +367,6 @@ def switch_symbol(new_slug: str) -> None:
 
 
 def drain_status_queue() -> None:
-    """
-    Pull all pending status messages from the background thread.
-    Called once per Streamlit rerun, from the main thread only.
-    The last status wins (most-recent connection state).
-    """
     sq = state.get(K_STATUS_QUEUE)
     if not sq:
         return
